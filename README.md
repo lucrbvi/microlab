@@ -8,6 +8,7 @@ Also all the code is written in Python using [tinygrad](https://tinygrad.org/).
 I recommend you to [clone the repository](https://git-scm.com/docs/git-clone) and open the vault in Obsidian. You can still read it all through the GitHub Web frontend but it's a far worse experience.
 Then you should install the packages by running `uv`
 I've also written a single line bash script to launch the virtual environment easily.
+You can check in the `md/` directory to find the documents linked with some scripts.
 ### Run scripts
 ```sh
 python3 -m scripts.attention
