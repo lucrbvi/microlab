@@ -1,4 +1,4 @@
-[See the code](/scripts/attention.py)
+[See the code](../scripts/attention.py)
 ### Recap
 Attention is a simple mechanism to calculate similarities between internal tokens in transformers.
 It's designed to be parallel, it means it's really fast to train and run in GPUs and other accelerators.
