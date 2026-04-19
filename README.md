@@ -12,5 +12,4 @@ You can check in the `md/` directory to find the documents linked with some scri
 ### Run scripts
 ```sh
 python3 -m scripts.attention
-python3 -m scripts.experimentation.attention
 ```

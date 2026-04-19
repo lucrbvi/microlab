@@ -1,21 +1,19 @@
-import math
+"""
+Implementation of the Transformer described in the paper "Attention is All You Need".
+"""
+
+import math, csv, os, time
 import urllib.request
-import csv
-import os
-import time
 import numpy as np
 from collections import Counter
-
 from tinygrad import Device, Tensor, TinyJit, dtypes, nn
 
-
 # Attention
-def attn(q: Tensor, k: Tensor, v: Tensor, dim: int, mask: Tensor | None = None):
-    core = (q @ k.T) / math.sqrt(dim)
+def attn(q: Tensor, k: Tensor, v: Tensor, dim: Tensor, mask: Tensor | None = None):
+    core = (q @ k.T) / dim.sqrt()
     if mask is not None:
         core = core + mask
     return core.softmax() @ v
-
 
 # Single head
 class attn_head:
@@ -42,8 +40,7 @@ class attn_head:
     ):
         k = k if k is not None else x
         v = v if v is not None else x
-        return attn(x @ self.wq, k @ self.wk, v @ self.wv, self.key_dim, mask)
-
+        return attn(x @ self.wq, k @ self.wk, v @ self.wv, Tensor(self.key_dim), mask)
 
 # Muli-Head Attention
 class mha:
@@ -70,7 +67,6 @@ class mha:
             out.append(self.heads[i](x, k, v, mask))
         return Tensor.cat(*out, dim=1) @ self.wo
 
-
 # Positional Encoding
 def pe(pos: int, i: int, dim: int):
     if i % 2 == 0:
@@ -78,7 +74,7 @@ def pe(pos: int, i: int, dim: int):
     else:
         return math.cos(pos / (10000 ** (2 * math.floor(i / 2) / dim)))
 
-
+# apply positional encoding on a tensor
 def pet(x: Tensor):
     seq_len, dim = x.shape
     pos = Tensor.arange(seq_len, device=x.device).reshape(-1, 1).float()
@@ -87,7 +83,6 @@ def pet(x: Tensor):
     div_term = 10000 ** (2 * (i // 2) / dim)
     pe = Tensor.where(i % 2 == 0, (pos / div_term).sin(), (pos / div_term).cos())
     return x + pe
-
 
 # The Transformer from "Attention is all you need"
 class Transformer:
@@ -195,10 +190,8 @@ class Transformer:
         out = self.last(self.decode(tgt, enc_out))
         return out
 
-
 def tokenize(s):
     return s.lower().split()
-
 
 def build_train_step(model: Transformer, optim, pad_id: int):
     @TinyJit
@@ -215,7 +208,6 @@ def build_train_step(model: Transformer, optim, pad_id: int):
 
     return train_step
 
-
 def build_vocab(pairs: list[tuple[str, str]], max_vocab: int = 8000):
     counter = Counter()
     for en, fr in pairs:
@@ -227,7 +219,6 @@ def build_vocab(pairs: list[tuple[str, str]], max_vocab: int = 8000):
     stoi = {w: i for i, w in enumerate(vocab)}
     return stoi
 
-
 def encode_text(text: str, stoi: dict[str, int], max_len: int = 32):
     ids = [stoi["<bos>"]]
     ids += [stoi.get(w, stoi["<unk>"]) for w in tokenize(text)][: max_len - 2]
@@ -235,15 +226,14 @@ def encode_text(text: str, stoi: dict[str, int], max_len: int = 32):
     ids += [stoi["<pad>"]] * (max_len - len(ids))
     return ids
 
-
 # train the transformer on a subset of WMT 2014 FR-EN
 def train_transformer(
     model: Transformer | None = None,
     optim=None,
-    epochs: int = 35,
-    batch_size: int = 16,
+    epochs: int = 50,
+    batch_size: int = 300,
     max_vocab: int = 40000,
-    max_len: int = 50,
+    max_len: int = 100,
 ):
     pairs = []  # store tuples (en, fr)
     if not os.path.exists("data.csv"):
@@ -266,7 +256,8 @@ def train_transformer(
         raise ValueError("Not enough sentence pairs in data.csv")
 
     stoi = build_vocab(pairs, max_vocab=max_vocab)
-    print(len(stoi))
+    print(f"vocab size: {len(stoi)}")
+    print("compiling model...")
     if model is None:
         model = Transformer(
             dim=30,
@@ -317,11 +308,11 @@ def train_transformer(
     for w, idx in stoi.items():
         model.itos[idx] = w
     model.max_len = max_len
+    Tensor.training = False
     return model
 
-
 if __name__ == "__main__":
-    print(Device.DEFAULT)
+    print(f"device: {Device.DEFAULT}")
     tokens = Tensor([[1.2, 1.5, 1.2], [0.7, 2.0, 0.7], [1.2, 1.5, 1.2]])
     m = mha(3, 1, 4)(tokens)
     print(f"MHA: \n{m.numpy()}\n")
