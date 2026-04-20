@@ -5,6 +5,6 @@ description = "A notebook to learn and experiment deep-learning from math to cod
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "numpy>=2.4.2",
-    "tinygrad>=0.12.0",
+    "numpy==2.4.2",
+    "tinygrad==0.12.0",
 ]
