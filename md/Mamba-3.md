@@ -2,9 +2,9 @@
 
 ### Recap
 
-Mamba-3 is the latest evolution of the Mamba family of architectures. Mamba is a reccurent neural network (similar in the idea to RNNs) with a hidden state. All architectures of the Mamba family are State Space Models (SSMs).
+Mamba-3 is the latest evolution of the Mamba family of architectures. Mamba can be seen as a reccurent neural network with a hidden state. All architectures of the Mamba family are State Space Models (SSMs).
 
-A Mamba model is formed of multiple Mamba blocks which are all SSMs. Mambas are also a good alternative to Transformers since they compress the information in a hidden state, they can be faster and lighter to run than Transformers with Multi-Head Attention.
+A Mamba model is formed of multiple Mamba blocks.
 
 ### State-Space Models (SSMs), Mamba-1 and Mamba-2
 

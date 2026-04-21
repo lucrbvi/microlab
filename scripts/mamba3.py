@@ -1,4 +1,4 @@
-from math import prod, sqrt
+from math import prod
 from typing import NamedTuple
 from tinygrad import Device, Tensor, nn
 
@@ -28,68 +28,6 @@ def apply_rope(x: Tensor, angles: Tensor) -> Tensor:
 
     return Tensor.stack([x_rot_even, x_rot_odd], dim=-1).flatten(-2)
 
-def ssd_mimo(x, A, B, C, chunk_size, initial_states=None):
-    assert x.shape[1] % chunk_size == 0, (
-        f"seqlen ({x.shape[1]}) must be divisible by chunk_size ({chunk_size})"
-    )
-
-    x, A, B, C = [
-        Tensor.rearrange(m, "b (c l) ... -> b c l ...", l=chunk_size) for m in (x, A, B, C)
-    ]
-
-    A = Tensor.rearrange(A, "b c l h -> b h c l")
-    A_cumsum = A.cumsum(-1)
-
-    L = segsum(A).exp()
-    Y_diag = Tensor.einsum("bclhnq, bcshnr, bhcls, bcshpr -> bclhpq", C, B, L, x)
-
-    decay_states = (A_cumsum[:, :, :, -1:] - A_cumsum).exp()
-    states = Tensor.einsum("bclhnr, bhcl, bclhpr -> bchpn", B, decay_states, x)
-
-    if initial_states is None:
-        initial_states = Tensor.zeros_like(states[:, :1])
-    states = Tensor.cat(initial_states, states, dim=1)
-    decay_chunk = segsum(A_cumsum[:, :, :, -1].pad((1, 0))).exp()
-    new_states = Tensor.einsum("bhzc, bchpn -> bzhpn", decay_chunk, states)
-    states, final_state = new_states[:, :-1], new_states[:, -1]
-
-    state_decay_out = A_cumsum.exp()
-    Y_off = Tensor.einsum("bclhnr, bchpn, bhcl -> bclhpr", C, states, state_decay_out)
-    Y = Tensor.rearrange(Y_diag + Y_off, "b c l h p r -> b (c l) h p r")
-
-    return Y, final_state
-
-def ssd(x, A, B, C, chunk_size, initial_states=None):
-    assert x.shape[1] % chunk_size == 0, (
-        f"seqlen ({x.shape[1]}) must be divisible by chunk_size ({chunk_size})"
-    )
-
-    x, A, B, C = [
-        Tensor.rearrange(m, "b (c l) ... -> b c l ...", l=chunk_size) for m in (x, A, B, C)
-    ]
-
-    A = Tensor.rearrange(A, "b c l h -> b h c l")
-    A_cumsum = A.cumsum(-1)
-
-    L = segsum(A).exp()
-    Y_diag = Tensor.einsum("bclhn, bcshn, bhcls, bcshp -> bclhp", C, B, L, x)
-
-    decay_states = Tensor.exp(A_cumsum[:, :, :, -1:] - A_cumsum)
-    states = Tensor.einsum("bclhn, bhcl, bclhp -> bchpn", B, decay_states, x)
-
-    if initial_states is None:
-        initial_states = Tensor.zeros_like(states[:, :1])
-    states = Tensor.cat(initial_states, states, dim=1)
-    decay_chunk = segsum(A_cumsum[:, :, :, -1].pad((1, 0))).exp()
-    new_states = Tensor.einsum("bhzc, bchpn -> bzhpn", decay_chunk, states)
-    states, final_state = new_states[:, :-1], new_states[:, -1]
-
-    state_decay_out = Tensor.exp(A_cumsum)
-    Y_off = Tensor.einsum("bclhn, bchpn, bhcl -> bclhp", C, states, state_decay_out)
-    Y = Tensor.rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
-
-    return Y, final_state
-
 class InferenceCache(NamedTuple):
     ssm_state: Tensor
     prev_Bx: Tensor
@@ -105,11 +43,8 @@ class InferenceCache(NamedTuple):
 
 class Mamba3Block:
     def __init__(self, dim: int, state_dim: int, hidden_mult: int, n_heads: int, mimo_rank: int | None, chunk_size: int):
-        bound = 1/sqrt(dim)
-        if not mimo_rank:
-            self.mimo_rank = 1
-        else:
-            self.mimo_rank = mimo_rank
+        self.mimo_rank = mimo_rank or 1
+        self.is_mimo = self.mimo_rank != 1
 
         self.dim = dim
         self.state_dim = state_dim
@@ -140,7 +75,7 @@ class Mamba3Block:
         self.B_norm = nn.RMSNorm(self.bc_dim, eps=1e-5)
         self.C_norm = nn.RMSNorm(self.bc_dim, eps=1e-5)
 
-        if mimo_rank is not None:
+        if self.is_mimo:
             self.mimo_x_proj = Tensor.ones(n_heads, self.head_dim, self.mimo_rank, requires_grad=True)
             self.mimo_z_proj = Tensor.ones(n_heads, self.head_dim, self.mimo_rank, requires_grad=True)
             self.mimo_down = Tensor.ones(n_heads, self.head_dim, self.mimo_rank, requires_grad=True) / self.mimo_rank
@@ -148,14 +83,78 @@ class Mamba3Block:
         self.out_norm = nn.RMSNorm(self.hidden_dim, eps=1e-5)
         self.out_proj = nn.Linear(self.hidden_dim, self.dim, bias=False)
 
+    def _discretize(self, dt: Tensor, lam: Tensor, A: Tensor):
+        dA = dt * A
+        alpha = dA.exp()
+        beta = (1 - lam) * dt * alpha
+        gamma = lam * dt
+        return dA, alpha, beta, gamma
+
+    def _ssd(self, x: Tensor, A: Tensor, B: Tensor, C: Tensor, initial_states: Tensor | None = None):
+        assert x.shape[1] % self.chunk_size == 0, (
+            f"seqlen ({x.shape[1]}) must be divisible by chunk_size ({self.chunk_size})"
+        )
+
+        x, A, B, C = [m.rearrange("b (c l) ... -> b c l ...", l=self.chunk_size) for m in (x, A, B, C)]
+        A = A.rearrange("b c l h -> b h c l")
+        A_cumsum = A.cumsum(-1)
+
+        L = segsum(A).exp()
+        decay_states = (A_cumsum[:, :, :, -1:] - A_cumsum).exp()
+        if self.is_mimo:
+            Y_diag = Tensor.einsum("bclhnq, bcshnr, bhcls, bcshpr -> bclhpq", C, B, L, x)
+            states = Tensor.einsum("bclhnr, bhcl, bclhpr -> bchpn", B, decay_states, x)
+        else:
+            Y_diag = Tensor.einsum("bclhn, bcshn, bhcls, bcshp -> bclhp", C, B, L, x)
+            states = Tensor.einsum("bclhn, bhcl, bclhp -> bchpn", B, decay_states, x)
+
+        if initial_states is None:
+            initial_states = Tensor.zeros_like(states[:, :1])
+        states = Tensor.cat(initial_states, states, dim=1)
+        decay_chunk = segsum(A_cumsum[:, :, :, -1].pad((1, 0))).exp()
+        new_states = Tensor.einsum("bhzc, bchpn -> bzhpn", decay_chunk, states)
+        states, final_state = new_states[:, :-1], new_states[:, -1]
+
+        state_decay_out = A_cumsum.exp()
+        if self.is_mimo:
+            Y_off = Tensor.einsum("bclhnr, bchpn, bhcl -> bclhpr", C, states, state_decay_out)
+            Y = (Y_diag + Y_off).rearrange("b c l h p r -> b (c l) h p r")
+        else:
+            Y_off = Tensor.einsum("bclhn, bchpn, bhcl -> bclhp", C, states, state_decay_out)
+            Y = (Y_diag + Y_off).rearrange("b c l h p -> b (c l) h p")
+
+        return Y, final_state
+
+    def _update_ssm_state(self, prev_state: Tensor, prev_Bx: Tensor, cur_Bx: Tensor, alpha: Tensor, beta: Tensor, gamma: Tensor):
+        alpha = alpha.rearrange("b h -> b h 1 1")
+        beta = beta.rearrange("b h -> b h 1 1")
+        gamma = gamma.rearrange("b h -> b h 1 1")
+        return prev_state * alpha + prev_Bx * beta + cur_Bx * gamma
+
+    def _prepare_BC(self, B: Tensor, C: Tensor, angles: Tensor):
+        if B.ndim == 2:
+            B = B.unsqueeze(1)
+            C = C.unsqueeze(1)
+
+        if self.is_mimo:
+            B = B.rearrange("b l (n r) -> b l n r", r=self.mimo_rank)
+            C = C.rearrange("b l (n r) -> b l n r", r=self.mimo_rank)
+            B = (B.rearrange("b l n r -> b l 1 n r") + self.B_bias).rearrange("b l h n r -> b l h r n")
+            C = (C.rearrange("b l n r -> b l 1 n r") + self.C_bias).rearrange("b l h n r -> b l h r n")
+            B = apply_rope(B, angles.unsqueeze(3)).rearrange("b l h r n -> b l h n r")
+            C = apply_rope(C, angles.unsqueeze(3)).rearrange("b l h r n -> b l h n r")
+            return B, C
+
+        B = B.rearrange("b l n -> b l 1 n") + self.B_bias.squeeze(-1)
+        C = C.rearrange("b l n -> b l 1 n") + self.C_bias.squeeze(-1)
+        return apply_rope(B, angles), apply_rope(C, angles)
+
     def init_state(self, batch_size: int):
         return InferenceCache.alloc(batch_size, self.n_heads, self.head_dim, self.state_dim)
 
     def __call__(self, u: Tensor, h: InferenceCache | None = None):
         if h is not None:
             return self.step(u, h)
-
-        batch, seqlen, dim = u.shape
 
         A = -self.A_log.exp() # always <0
 
@@ -175,99 +174,40 @@ class Mamba3Block:
         B = self.B_norm(B)
         C = self.C_norm(C)
 
-        raw_angles = dt.unsqueeze(-1) * Tensor.rearrange(theta, "b l n -> b l 1 n")
-        angles = -raw_angles.cumsum(1)
+        angle_steps = dt.unsqueeze(-1) * theta.rearrange("b l n -> b l 1 n")
+        angles = -angle_steps.cumsum(1)
 
-        dA = dt * Tensor.rearrange(A, "h -> 1 1 h")
-        alpha = dA.exp()
-        beta = (1 - lam) * dt * alpha
-        gamma = lam * dt
+        dA, _, beta, gamma = self._discretize(dt, lam, A.rearrange("h -> 1 1 h"))
 
-        x = Tensor.rearrange(x, "b l (h p) -> b l h p", p=self.head_dim)
+        x = x.rearrange("b l (h p) -> b l h p", p=self.head_dim)
 
-        if self.mimo_rank != 1:
-            R = self.mimo_rank
+        B, C = self._prepare_BC(B, C, angles)
+        x_ssd = x.unsqueeze(-1) * self.mimo_x_proj if self.is_mimo else x
+        gamma_x = x_ssd * gamma.rearrange("b l h -> b l h 1 1") if self.is_mimo else x_ssd * gamma.unsqueeze(-1)
+        beta_x = shift_right(x_ssd) * beta.rearrange("b l h -> b l h 1 1") if self.is_mimo else shift_right(x_ssd) * beta.unsqueeze(-1)
 
-            B = Tensor.rearrange(B, "b l (n r) -> b l n r", r=R)
-            C = Tensor.rearrange(C, "b l (n r) -> b l n r", r=R)
-            B = Tensor.rearrange(B, "b l n r -> b l 1 n r") + self.B_bias
-            C = Tensor.rearrange(C, "b l n r -> b l 1 n r") + self.C_bias
+        y_gamma, state_gamma = self._ssd(gamma_x, dA, B, C)
+        y_beta, state_beta = self._ssd(beta_x, dA, shift_right(B), C)
 
-            B = Tensor.rearrange(B, "b l h n r -> b l h r n")
-            C = Tensor.rearrange(C, "b l h n r -> b l h r n")
-            B = apply_rope(B, angles.unsqueeze(3))
-            C = apply_rope(C, angles.unsqueeze(3))
-            B = Tensor.rearrange(B, "b l h r n -> b l h n r")
-            C = Tensor.rearrange(C, "b l h r n -> b l h n r")
+        y = y_gamma + y_beta
+        D = self.D.rearrange("h -> 1 h 1")
+        y = y + (x * D).unsqueeze(-1) if self.is_mimo else y + x * D
+        ssm_state = state_gamma + state_beta
 
-            x_mimo = x.unsqueeze(-1) * self.mimo_x_proj
-            y_gamma, state_gamma = ssd_mimo(
-                x_mimo * Tensor.rearrange(gamma, "b l h -> b l h 1 1"),
-                dA, B, C, self.chunk_size
-            )
-
-            B_prev = shift_right(B)
-            x_mimo_prev = shift_right(x_mimo)
-
-            y_beta, state_beta = ssd_mimo(
-                x_mimo_prev * Tensor.rearrange(beta, "b l h -> b l h 1 1"),
-                dA, B_prev, C, self.chunk_size
-            )
-
-            y = y_gamma + y_beta
-            ssm_state = state_gamma + state_beta
-
-            y = y + (x * self.D.unsqueeze(-1)).unsqueeze(-1)
-
-            z_heads = Tensor.rearrange(z, "b l (h p) -> b l h p", p=self.head_dim)
-            z_mimo = z_heads.unsqueeze(-1) * self.mimo_z_proj
-            y = y * z_mimo.silu()
-
-            y = (y * self.mimo_down).sum(-1)
-            y = Tensor.rearrange(y, "b l h p -> b l (h p)")
-            y = self.out_proj(y)
-
-            last_Bx = Tensor.einsum(
-                "bhnr, bhpr -> bhpn",
-                B[:, -1], x_mimo[:, -1],
-            )
-        else:
-            B = Tensor.rearrange(B, "b l n -> b l 1 n") + self.B_bias.squeeze(-1)
-            C = Tensor.rearrange(C, "b l n -> b l 1 n") + self.C_bias.squeeze(-1)
-            B = apply_rope(B, angles)
-            C = apply_rope(C, angles)
-
-            y_gamma, state_gamma = ssd(
-                x * gamma.unsqueeze(-1), dA, B, C, self.chunk_size,
-            )
-
-            B_prev = shift_right(B)
-            x_prev = shift_right(x)
-
-            y_beta, state_beta = ssd(
-                x_prev * beta.unsqueeze(-1), dA, B_prev, C, self.chunk_size,
-            )
-
-            y = y_gamma + y_beta
-            ssm_state = state_gamma + state_beta
-
-            y = y + x * self.D.unsqueeze(-1)
-
-            y = Tensor.rearrange(y, "b l h p -> b l (h p)")
+        if self.is_mimo:
+            last_Bx = Tensor.einsum("bhnr, bhpr -> bhpn", B[:, -1], x_ssd[:, -1])
+            z = z.rearrange("b l (h p) -> b l h p", p=self.head_dim).unsqueeze(-1) * self.mimo_z_proj
             y = y * z.silu()
-            y = self.out_proj(y)
+            y = (y * self.mimo_down).sum(-1)
+        else:
+            last_Bx = Tensor.einsum("bhn, bhp -> bhpn", B[:, -1], x_ssd[:, -1])
+            y = y.rearrange("b l h p -> b l (h p)")
+            y = self.out_proj(self.out_norm(y * z.silu()))
 
-            last_Bx = Tensor.einsum(
-                "bhn, bhp -> bhpn",
-                B[:, -1], x[:, -1],
-            )
+        if self.is_mimo:
+            y = self.out_proj(self.out_norm(y.rearrange("b l h p -> b l (h p)")))
 
-        last_angle = angles[:, -1:]
-        h_new = InferenceCache(
-            ssm_state=ssm_state,
-            prev_Bx=last_Bx,
-            cum_angle=last_angle.squeeze(1)
-        )
+        h_new = InferenceCache(ssm_state=ssm_state, prev_Bx=last_Bx, cum_angle=angles[:, -1])
         return y, h_new
     
     def step(self, u: Tensor, h: InferenceCache) -> tuple[Tensor, InferenceCache]:
@@ -291,97 +231,43 @@ class Mamba3Block:
         B = self.B_norm(B)
         C = self.C_norm(C)
 
-        raw_angle = (
+        angle_step = (
             dt.unsqueeze(-1)
             * theta.unsqueeze(1)
         ) 
-        new_cum_angle = h.cum_angle - raw_angle
+        new_cum_angle = h.cum_angle - angle_step
 
-        dA = dt * A
-        alpha = dA.exp()
-        beta = (1 - lam) * dt * alpha
-        gamma = lam * dt
+        _, alpha, beta, gamma = self._discretize(dt, lam, A)
 
-        x = Tensor.rearrange(x, "b (h p) -> b h p", p=self.head_dim)
+        x = x.rearrange("b (h p) -> b h p", p=self.head_dim)
 
-        if self.mimo_rank != 1:
-            R = self.mimo_rank
+        B, C = self._prepare_BC(B, C, new_cum_angle)
+        B = B.squeeze(1)
+        C = C.squeeze(1)
+        x_state = x.unsqueeze(-1) * self.mimo_x_proj if self.is_mimo else x
 
-            B = Tensor.rearrange(B, "b (n r) -> b n r", r=R)
-            C = Tensor.rearrange(C, "b (n r) -> b n r", r=R)
-            B = B.unsqueeze(1) + self.B_bias
-            C = C.unsqueeze(1) + self.C_bias
-
-            B = Tensor.rearrange(B, "b h n r -> b h r n")
-            C = Tensor.rearrange(C, "b h n r -> b h r n")
-            B = apply_rope(B, new_cum_angle.unsqueeze(2))  # broadcast over rank
-            C = apply_rope(C, new_cum_angle.unsqueeze(2))
-            B = Tensor.rearrange(B, "b h r n -> b h n r")
-            C = Tensor.rearrange(C, "b h r n -> b h n r")
-
-            # ── Expand x to rank R ──
-            x_mimo = x.unsqueeze(-1) * self.mimo_x_proj  # (batch, nheads, headdim, R)
-
-            # ── MIMO state update: B @ X^T contracts rank R ──
-            BX = Tensor.einsum("bhnr, bhpr -> bhpn", B, x_mimo)
-
-            new_ssm_state = (
-                h.ssm_state * Tensor.rearrange(alpha, "b h -> b h 1 1")
-                + h.prev_Bx * Tensor.rearrange(beta, "b h -> b h 1 1")
-                + BX * Tensor.rearrange(gamma, "b h -> b h 1 1")
-            )
-
-            # ── Output: H^T @ C → (headdim, R) per head ──
-            y = Tensor.einsum("bhpn, bhnr -> bhpr", new_ssm_state, C)
-
-            # ── Skip connection in rank-R space ──
-            y = y + (x * Tensor.rearrange(self.D, "h -> 1 h 1")).unsqueeze(-1)
-
-            # ── Gate in rank-R space ──
-            z_heads = Tensor.rearrange(z, "b (h p) -> b h p", p=self.head_dim)
-            z_mimo = z_heads.unsqueeze(-1) * self.mimo_z_proj  # (batch, nheads, P, R)
-            y = y * z_mimo.silu()
-
-            # ── Down-project rank ──
-            y = (y * self.mimo_down).sum(-1)
-            y = Tensor.rearrange(y, "b h p -> b (h p)")
-            y = self.out_proj(y)
-
-            h_new = InferenceCache(
-                ssm_state=new_ssm_state,
-                prev_Bx=BX,
-                cum_angle=new_cum_angle,
-            )
-            return y.unsqueeze(1), h_new
-
+        if self.is_mimo:
+            Bx = Tensor.einsum("bhnr, bhpr -> bhpn", B, x_state)
         else:
-            # ── SISO path ──
-            B = B.unsqueeze(1) + self.B_bias.squeeze(-1)
-            C = C.unsqueeze(1) + self.C_bias.squeeze(-1)
-            B = apply_rope(B, new_cum_angle)
-            C = apply_rope(C, new_cum_angle)
+            Bx = Tensor.einsum("bhn, bhp -> bhpn", B, x_state)
 
-            Bx = Tensor.einsum("bhn, bhp -> bhpn", B, x)
+        ssm_state = self._update_ssm_state(h.ssm_state, h.prev_Bx, Bx, alpha, beta, gamma)
 
-            new_ssm_state = (
-                h.ssm_state * Tensor.rearrange(alpha, "b h -> b h 1 1")
-                + h.prev_Bx * Tensor.rearrange(beta, "b h -> b h 1 1")
-                + Bx * Tensor.rearrange(gamma, "b h -> b h 1 1")
-            )
-
-            y = Tensor.einsum("bhpn, bhn -> bhp", new_ssm_state, C)
-            y = y + Tensor.rearrange(self.D, "h -> h 1") * x
-
-            y = Tensor.rearrange(y, "b h p -> b (h p)")
+        if self.is_mimo:
+            y = Tensor.einsum("bhpn, bhnr -> bhpr", ssm_state, C)
+            y = y + (x * self.D.rearrange("h -> 1 h 1")).unsqueeze(-1)
+            z = z.rearrange("b (h p) -> b h p", p=self.head_dim).unsqueeze(-1) * self.mimo_z_proj
             y = y * z.silu()
-            y = self.out_proj(y)
+            y = (y * self.mimo_down).sum(-1)
+            y = self.out_proj(y.rearrange("b h p -> b (h p)"))
+        else:
+            y = Tensor.einsum("bhpn, bhn -> bhp", ssm_state, C)
+            y = y + x * self.D.rearrange("h -> 1 h 1")
+            y = y.rearrange("b h p -> b (h p)")
+            y = self.out_proj(y * z.silu())
 
-            h_new = InferenceCache(
-                ssm_state=new_ssm_state,
-                prev_Bx=Bx,
-                cum_angle=new_cum_angle,
-            )
-            return y.unsqueeze(1), h_new
+        h_new = InferenceCache(ssm_state=ssm_state, prev_Bx=Bx, cum_angle=new_cum_angle)
+        return y.unsqueeze(1), h_new
 
 class SwiGLUBlock:
     def __init__(self, dim: int, hidden_dim: int | None = None):
@@ -444,11 +330,12 @@ class Mamba3LMHeadModel:
 if __name__ == "__main__":
     print("Device:", Device.DEFAULT)
 
-    m = Mamba3LMHeadModel(dim=10, blocks=2, vocab_size=32, state_dim=20, n_heads=2, mimo_rank=2, chunk_size=2)
+    m = Mamba3LMHeadModel(dim=10, blocks=2, vocab_size=32, state_dim=20, n_heads=2, mimo_rank=5, chunk_size=2)
     params = nn.state.get_parameters(m)
     print("n_params:", sum(prod(p.shape) for p in params))
 
-    seq = Tensor([[1, 2, 3, 4]])
+    seq = Tensor([[3, 2]])
     ys, _ = m(seq)
+    ys = ys.softmax()
     print("ys:", ys.numpy())
     print("ys.shape:", ys.shape)
